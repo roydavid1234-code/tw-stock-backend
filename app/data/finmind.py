@@ -7,14 +7,41 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from datetime import date, timedelta
-from functools import lru_cache
 
 import httpx
 import pandas as pd
 
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "").strip()
+
+# 日 K 一天才更新一次，沒必要每次請求都打 FinMind。用 in-memory TTL 快取把
+# 重複查詢擋下來，避免打爆免費額度（HTTP 402）。可用 env 覆寫秒數。
+KLINE_TTL = int(os.environ.get("FINMIND_KLINE_TTL", "3600"))
+STOCKINFO_TTL = int(os.environ.get("FINMIND_STOCKINFO_TTL", "86400"))
+
+# key -> (expires_at_epoch, value)
+_cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key: str):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is None:
+            return None
+        expires_at, value = hit
+        if time.time() >= expires_at:
+            _cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(key: str, value: object, ttl: int) -> None:
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, value)
 
 
 class FinMindError(RuntimeError):
@@ -36,7 +63,13 @@ def _request(dataset: str, params: dict) -> list[dict]:
 
 
 def fetch_daily_kline(stock_id: str, lookback_days: int = 365) -> pd.DataFrame:
-    """抓取台股日 K。`stock_id` 例如 '2330'、'0050'。"""
+    """抓取台股日 K。`stock_id` 例如 '2330'、'0050'。結果快取 KLINE_TTL 秒。"""
+    cache_key = f"kline:{stock_id}:{lookback_days}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        # 回傳 copy，避免下游 indicator 就地改動污染快取
+        return cached.copy()
+
     end = date.today()
     # 多抓一些以涵蓋非交易日
     start = end - timedelta(days=int(lookback_days * 1.6) + 30)
@@ -69,13 +102,21 @@ def fetch_daily_kline(stock_id: str, lookback_days: int = 365) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     # 只保留請求視窗
-    return df.tail(lookback_days).reset_index(drop=True)
+    df = df.tail(lookback_days).reset_index(drop=True)
+    _cache_set(cache_key, df, KLINE_TTL)
+    return df.copy()
 
 
-@lru_cache(maxsize=64)
 def search_stock(keyword: str) -> list[dict]:
-    """以名稱/代碼搜尋台股。回傳 [{stock_id, stock_name, industry_category}]。"""
-    rows = _request("TaiwanStockInfo", {})
+    """以名稱/代碼搜尋台股。回傳 [{stock_id, stock_name, industry_category}]。
+
+    TaiwanStockInfo 全表幾乎不變，整份快取 STOCKINFO_TTL 秒，搜尋只在本地過濾。
+    """
+    rows = _cache_get("stockinfo:all")
+    if rows is None:
+        rows = _request("TaiwanStockInfo", {})
+        _cache_set("stockinfo:all", rows, STOCKINFO_TTL)
+
     keyword = keyword.strip().lower()
     matches = [
         {
